@@ -8,9 +8,9 @@ import (
 
 	"github.com/google/uuid"
 
+	"auth-service/internal/config"
 	"auth-service/internal/kv"
 	"auth-service/internal/rbac"
-	"auth-service/internal/security"
 	"auth-service/internal/store"
 )
 
@@ -22,17 +22,20 @@ func (f fakeAccess) GetUserAccess(_ context.Context, _, tenantID uuid.UUID) (sto
 	return f[tenantID], nil
 }
 
-func newUnitServer(t *testing.T, access fakeAccess) *Server {
+func newUnitServer(t *testing.T, access fakeAccess, mutate ...func(*config.Config)) *Server {
 	t.Helper()
 	cfg := testConfig()
+	for _, m := range mutate {
+		m(&cfg)
+	}
 	cache := kv.NewMemory()
 	t.Cleanup(func() { cache.Close() })
-	return &Server{
-		Config: cfg,
-		Tokens: security.NewTokenManager(cfg.JWTSecret, cfg.AccessTokenTTL),
-		RBAC:   rbac.NewService(access, cache, cfg.PermissionCacheTTL),
-		KV:     cache,
+	s, err := New(cfg, nil, nil, cache) // tanpa database & audit
+	if err != nil {
+		t.Fatal(err)
 	}
+	s.RBAC = rbac.NewService(access, cache, cfg.PermissionCacheTTL)
+	return s
 }
 
 func serve(h http.Handler, token string, headers ...string) int {
@@ -73,6 +76,61 @@ func TestGuardPermission(t *testing.T) {
 	// permission tenant lain tidak boleh bocor.
 	if got := serve(s.guard("audit:read", okHandler), tokA); got != http.StatusForbidden {
 		t.Errorf("permission tenant lain: %d", got)
+	}
+}
+
+func TestBlacklistedTokenRejected(t *testing.T) {
+	tenant := uuid.New()
+	s := newUnitServer(t, fakeAccess{tenant: {Permissions: []string{"users:read"}}})
+	tok, claims, _ := s.Tokens.Issue(uuid.New(), tenant)
+	h := s.guard("users:read", okHandler)
+
+	if got := serve(h, tok); got != http.StatusOK {
+		t.Fatalf("sebelum dicabut: %d", got)
+	}
+	_ = s.Blacklist.Revoke(context.Background(), claims.ID, claims.ExpiresAt.Time)
+	if got := serve(h, tok); got != http.StatusUnauthorized {
+		t.Fatalf("token di blacklist harus ditolak: %d", got)
+	}
+}
+
+func TestRequire2FA(t *testing.T) {
+	tenant := uuid.New()
+	s := newUnitServer(t, fakeAccess{tenant: {Permissions: []string{"users:create"}}})
+	tok, _, _ := s.Tokens.Issue(uuid.New(), tenant)
+	h := s.guardSensitive("users:create", okHandler)
+
+	if got := serve(h, tok); got != http.StatusForbidden {
+		t.Errorf("tanpa header 2FA: %d", got)
+	}
+	if got := serve(h, tok, "X-2FA-Code", "000000"); got != http.StatusForbidden {
+		t.Errorf("kode 2FA salah: %d", got)
+	}
+	if got := serve(h, tok, "X-2FA-Code", testTwoFA); got != http.StatusOK {
+		t.Errorf("kode 2FA benar: %d", got)
+	}
+}
+
+func TestIPWhitelist(t *testing.T) {
+	s := newUnitServer(t, fakeAccess{}, func(c *config.Config) {
+		c.IPWhitelist = []string{"10.0.0.0/8"}
+	})
+	h := s.Handler()
+	call := func(path, ip string) int {
+		req := httptest.NewRequest("GET", path, nil)
+		req.RemoteAddr = ip + ":1234"
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	if got := call("/auth/me", "192.168.1.1"); got != http.StatusForbidden {
+		t.Errorf("IP di luar whitelist: %d", got)
+	}
+	if got := call("/auth/me", "10.1.2.3"); got != http.StatusUnauthorized {
+		t.Errorf("IP di whitelist harus lolos ke authenticate (401 tanpa token): %d", got)
+	}
+	if got := call("/healthz", "192.168.1.1"); got != http.StatusOK {
+		t.Errorf("/healthz dikecualikan: %d", got)
 	}
 }
 

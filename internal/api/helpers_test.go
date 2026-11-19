@@ -15,8 +15,6 @@ import (
 	"auth-service/internal/audit"
 	"auth-service/internal/config"
 	"auth-service/internal/kv"
-	"auth-service/internal/rbac"
-	"auth-service/internal/security"
 	"auth-service/internal/store"
 	"auth-service/internal/testdb"
 )
@@ -44,17 +42,11 @@ func testConfig() config.Config {
 func newIntegrationServer(t *testing.T) *testClient {
 	t.Helper()
 	pool := testdb.Pool(t)
-	cfg := testConfig()
 	cache := kv.NewMemory()
 	t.Cleanup(func() { cache.Close() })
-	st := store.New(pool)
-	s := &Server{
-		Config: cfg,
-		Store:  st,
-		Audit:  audit.NewLogger(pool),
-		Tokens: security.NewTokenManager(cfg.JWTSecret, cfg.AccessTokenTTL),
-		RBAC:   rbac.NewService(st, cache, cfg.PermissionCacheTTL),
-		KV:     cache,
+	s, err := New(testConfig(), store.New(pool), audit.NewLogger(pool), cache)
+	if err != nil {
+		t.Fatal(err)
 	}
 	return &testClient{t: t, h: s.Handler(), srv: s}
 }

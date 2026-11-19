@@ -75,11 +75,31 @@ func TestRefreshRotationAndReuseDetection(t *testing.T) {
 	c.expect(c.do("POST", "/auth/refresh", "", map[string]any{"refresh_token": "garbage"}), http.StatusUnauthorized)
 }
 
-func TestLogoutRevokesRefreshToken(t *testing.T) {
+func TestLogoutRevokesTokens(t *testing.T) {
 	c := newIntegrationServer(t)
 	f := c.newTenant()
 
 	c.expect(c.do("POST", "/auth/logout", "", nil), http.StatusUnauthorized)
 	c.expect(c.do("POST", "/auth/logout", f.Access, map[string]any{"refresh_token": f.Refresh}), http.StatusNoContent)
+	// Access token masuk blacklist, refresh token dicabut.
+	c.expect(c.do("GET", "/auth/me", f.Access, nil), http.StatusUnauthorized)
 	c.expect(c.do("POST", "/auth/refresh", "", map[string]any{"refresh_token": f.Refresh}), http.StatusUnauthorized)
+}
+
+func TestLoginRateLimit(t *testing.T) {
+	c := newIntegrationServer(t)
+	f := c.newTenant() // login sukses di sini me-reset counter
+
+	bad := map[string]any{"email": f.Email, "password": "wrong-password", "tenant_slug": f.Slug}
+	for range c.srv.Config.LoginMaxAttempts {
+		c.expect(c.do("POST", "/auth/login", "", bad), http.StatusUnauthorized)
+	}
+	r := c.expect(c.do("POST", "/auth/login", "", bad), http.StatusTooManyRequests)
+	if r.Body["error"] != "too_many_attempts" {
+		t.Fatalf("harus too_many_attempts: %s", r.Raw)
+	}
+	// Password benar pun ditolak selama window masih berjalan.
+	c.expect(c.do("POST", "/auth/login", "", map[string]any{
+		"email": f.Email, "password": testPass, "tenant_slug": f.Slug,
+	}), http.StatusTooManyRequests)
 }

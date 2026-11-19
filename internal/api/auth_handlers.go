@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -112,6 +113,21 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	req.Email = normalizeEmail(req.Email)
 	ctx := r.Context()
 
+	// Rate limit per (IP + email): membatasi brute force password satu akun
+	// tanpa membuat penyerang bisa mengunci akun korban dari IP lain.
+	limitKey := "login:" + requestInfoFrom(ctx).IP + ":" + req.Email
+	allowed, err := s.LoginLimiter.Allow(ctx, limitKey)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	if !allowed {
+		s.logAudit(r, audit.ActionLoginRateLimited, nil, nil, map[string]any{"email": req.Email})
+		w.Header().Set("Retry-After", strconv.Itoa(int(s.LoginLimiter.Window().Seconds())))
+		writeError(w, http.StatusTooManyRequests, "too_many_attempts", "terlalu banyak percobaan login, coba lagi nanti")
+		return
+	}
+
 	// Semua kegagalan memberi pesan yang sama agar penyerang tidak bisa
 	// membedakan "email tidak ada", "password salah", atau "bukan anggota tenant".
 	fail := func(reason string, userID, tenantID *uuid.UUID) {
@@ -160,6 +176,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		internalError(w, err)
 		return
 	}
+	_ = s.LoginLimiter.Reset(ctx, limitKey)
 	s.logAudit(r, audit.ActionLogin, &user.ID, &tenant.ID, nil)
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -216,13 +233,18 @@ func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, tokenResponse{access, newRaw, "Bearer", int(s.Tokens.TTL().Seconds())})
 }
 
-// POST /auth/logout: mencabut refresh token (seluruh family) milik pemanggil.
+// POST /auth/logout: access token saat ini masuk blacklist (sampai
+// kedaluwarsa) dan refresh token (seluruh family-nya) dicabut.
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	p := principalFrom(r.Context())
 	var req struct {
 		RefreshToken string `json:"refresh_token"`
 	}
 	if r.ContentLength != 0 && !decodeJSON(w, r, &req) {
+		return
+	}
+	if err := s.Blacklist.Revoke(r.Context(), p.TokenID, p.ExpiresAt); err != nil {
+		internalError(w, err)
 		return
 	}
 	if req.RefreshToken != "" {

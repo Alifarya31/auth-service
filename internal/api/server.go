@@ -16,18 +16,33 @@ import (
 )
 
 type Server struct {
-	Config config.Config
-	Store  *store.Store
-	Audit  *audit.Logger
-	Tokens *security.TokenManager
-	RBAC   *rbac.Service
-	KV     kv.Store
+	Config       config.Config
+	Store        *store.Store
+	Audit        *audit.Logger
+	Tokens       *security.TokenManager
+	RBAC         *rbac.Service
+	Blacklist    *security.Blacklist
+	LoginLimiter *security.RateLimiter
+	IPAllow      *security.IPAllowlist
 }
 
-// guard menyusun rantai middleware untuk endpoint terproteksi:
-// authenticate (siapa?) -> requirePermission (boleh?) -> handler.
-func (s *Server) guard(perm string, h http.HandlerFunc) http.Handler {
-	return s.authenticate(s.requirePermission(perm, h))
+// New merakit Server dari konfigurasi. cache dipakai bersama untuk cache
+// permission, blacklist token, dan counter rate limit.
+func New(cfg config.Config, st *store.Store, auditLog *audit.Logger, cache kv.Store) (*Server, error) {
+	allow, err := security.ParseIPAllowlist(cfg.IPWhitelist)
+	if err != nil {
+		return nil, err
+	}
+	return &Server{
+		Config:       cfg,
+		Store:        st,
+		Audit:        auditLog,
+		Tokens:       security.NewTokenManager(cfg.JWTSecret, cfg.AccessTokenTTL),
+		RBAC:         rbac.NewService(st, cache, cfg.PermissionCacheTTL),
+		Blacklist:    security.NewBlacklist(cache),
+		LoginLimiter: security.NewRateLimiter(cache, cfg.LoginMaxAttempts, cfg.LoginWindow),
+		IPAllow:      allow,
+	}, nil
 }
 
 // Handler menyusun semua route. Memakai router bawaan Go (net/http,
@@ -45,7 +60,20 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /auth/refresh", s.handleRefresh)
 	mux.Handle("POST /auth/logout", s.authenticate(http.HandlerFunc(s.handleLogout)))
 	mux.Handle("GET /auth/me", s.authenticate(http.HandlerFunc(s.handleMe)))
-	return s.withRequestInfo(mux)
+
+	// Urutan luar -> dalam: catat IP klien, lalu cek IP whitelist.
+	return s.withRequestInfo(s.ipWhitelist(mux))
+}
+
+// guard menyusun rantai middleware untuk endpoint terproteksi:
+// authenticate (siapa?) -> requirePermission (boleh?) -> handler.
+func (s *Server) guard(perm string, h http.HandlerFunc) http.Handler {
+	return s.authenticate(s.requirePermission(perm, h))
+}
+
+// guardSensitive sama dengan guard, ditambah verifikasi 2FA.
+func (s *Server) guardSensitive(perm string, h http.HandlerFunc) http.Handler {
+	return s.authenticate(s.requirePermission(perm, s.require2FA(h)))
 }
 
 // logAudit mencatat event audit dengan IP dan user agent dari request.

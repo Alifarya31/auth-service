@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"net"
 	"net/http"
 	"strings"
@@ -81,6 +82,16 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 			writeError(w, http.StatusUnauthorized, "invalid_token", "access token tidak valid atau kedaluwarsa")
 			return
 		}
+		// Token yang sudah di-logout ada di blacklist (berdasarkan jti).
+		revoked, err := s.Blacklist.IsRevoked(r.Context(), claims.ID)
+		if err != nil {
+			internalError(w, err) // fail closed: jangan terima token jika status tidak bisa dicek
+			return
+		}
+		if revoked {
+			writeError(w, http.StatusUnauthorized, "token_revoked", "access token sudah dicabut")
+			return
+		}
 		userID, _ := claims.UserID()
 		p := Principal{
 			UserID:    userID,
@@ -107,6 +118,35 @@ func (s *Server) requirePermission(perm string, next http.Handler) http.Handler 
 			s.logAudit(r, audit.ActionAccessDenied, &p.UserID, &p.TenantID,
 				map[string]any{"permission": perm, "path": r.URL.Path, "method": r.Method})
 			writeError(w, http.StatusForbidden, "forbidden", "tidak punya permission "+perm)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// ipWhitelist menolak request dari IP di luar IP_WHITELIST. /healthz
+// dikecualikan agar health check container tetap jalan.
+func (s *Server) ipWhitelist(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/healthz" && !s.IPAllow.Allowed(requestInfoFrom(r.Context()).IP) {
+			writeError(w, http.StatusForbidden, "ip_not_allowed", "IP tidak diizinkan")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// require2FA mensimulasikan 2FA untuk endpoint sensitif: header X-2FA-Code
+// harus sama dengan TWO_FA_CODE. Di produksi ini diganti verifikasi TOTP
+// per user. Perbandingan constant-time mencegah timing attack.
+func (s *Server) require2FA(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		code := r.Header.Get("X-2FA-Code")
+		if code == "" || subtle.ConstantTimeCompare([]byte(code), []byte(s.Config.TwoFACode)) != 1 {
+			p := principalFrom(r.Context())
+			s.logAudit(r, audit.ActionAccessDenied, &p.UserID, &p.TenantID,
+				map[string]any{"reason": "2fa_failed", "path": r.URL.Path, "method": r.Method})
+			writeError(w, http.StatusForbidden, "2fa_required", "endpoint ini butuh header X-2FA-Code yang valid")
 			return
 		}
 		next.ServeHTTP(w, r)

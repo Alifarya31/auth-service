@@ -9,6 +9,8 @@ import (
 
 	"auth-service/internal/audit"
 	"auth-service/internal/config"
+	"auth-service/internal/kv"
+	"auth-service/internal/rbac"
 	"auth-service/internal/security"
 	"auth-service/internal/store"
 )
@@ -18,6 +20,14 @@ type Server struct {
 	Store  *store.Store
 	Audit  *audit.Logger
 	Tokens *security.TokenManager
+	RBAC   *rbac.Service
+	KV     kv.Store
+}
+
+// guard menyusun rantai middleware untuk endpoint terproteksi:
+// authenticate (siapa?) -> requirePermission (boleh?) -> handler.
+func (s *Server) guard(perm string, h http.HandlerFunc) http.Handler {
+	return s.authenticate(s.requirePermission(perm, h))
 }
 
 // Handler menyusun semua route. Memakai router bawaan Go (net/http,
@@ -35,7 +45,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /auth/refresh", s.handleRefresh)
 	mux.Handle("POST /auth/logout", s.authenticate(http.HandlerFunc(s.handleLogout)))
 	mux.Handle("GET /auth/me", s.authenticate(http.HandlerFunc(s.handleMe)))
-
 	return s.withRequestInfo(mux)
 }
 

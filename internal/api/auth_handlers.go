@@ -249,7 +249,7 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		internalError(w, err)
 		return
 	}
-	access, err := s.Store.GetUserAccess(ctx, p.UserID, p.TenantID)
+	access, err := s.RBAC.Access(ctx, p.UserID, p.TenantID)
 	if err != nil {
 		internalError(w, err)
 		return

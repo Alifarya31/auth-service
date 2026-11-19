@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"auth-service/internal/audit"
 )
 
 type ctxKey int
@@ -88,4 +90,31 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxPrincipal, p)))
 	})
+}
+
+// requirePermission memeriksa permission secara dinamis per endpoint.
+// Permission dibaca dari RBAC service (cache -> database) untuk tenant di
+// token, sehingga user tidak pernah bisa memakai permission dari tenant lain.
+func (s *Server) requirePermission(perm string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := principalFrom(r.Context())
+		ok, err := s.RBAC.HasPermission(r.Context(), p.UserID, p.TenantID, perm)
+		if err != nil {
+			internalError(w, err)
+			return
+		}
+		if !ok {
+			s.logAudit(r, audit.ActionAccessDenied, &p.UserID, &p.TenantID,
+				map[string]any{"permission": perm, "path": r.URL.Path, "method": r.Method})
+			writeError(w, http.StatusForbidden, "forbidden", "tidak punya permission "+perm)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// sameTenant mencegah IDOR lintas tenant: ID tenant di URL harus sama
+// dengan tenant di token.
+func sameTenant(p Principal, tenantID uuid.UUID) bool {
+	return p.TenantID == tenantID
 }

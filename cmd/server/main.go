@@ -14,6 +14,8 @@ import (
 	"auth-service/internal/audit"
 	"auth-service/internal/config"
 	"auth-service/internal/database"
+	"auth-service/internal/kv"
+	"auth-service/internal/rbac"
 	"auth-service/internal/security"
 	"auth-service/internal/store"
 	"auth-service/migrations"
@@ -46,11 +48,17 @@ func run() error {
 		return err
 	}
 
+	cache := openKV(ctx, cfg.RedisURL)
+	defer cache.Close()
+
+	st := store.New(pool)
 	srv := &api.Server{
 		Config: cfg,
-		Store:  store.New(pool),
+		Store:  st,
 		Audit:  audit.NewLogger(pool),
 		Tokens: security.NewTokenManager(cfg.JWTSecret, cfg.AccessTokenTTL),
+		RBAC:   rbac.NewService(st, cache, cfg.PermissionCacheTTL),
+		KV:     cache,
 	}
 
 	httpServer := &http.Server{
@@ -80,4 +88,22 @@ func run() error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return httpServer.Shutdown(shutdownCtx)
+}
+
+// openKV memakai Redis jika REDIS_URL diisi dan bisa dihubungi; jika tidak,
+// fallback ke store in-memory (cukup untuk satu instance).
+func openKV(ctx context.Context, url string) kv.Store {
+	if url == "" {
+		slog.Info("REDIS_URL kosong, memakai cache in-memory")
+		return kv.NewMemory()
+	}
+	pingCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	r, err := kv.NewRedis(pingCtx, url)
+	if err != nil {
+		slog.Warn("Redis tidak tersedia, fallback ke cache in-memory", "err", err)
+		return kv.NewMemory()
+	}
+	slog.Info("memakai Redis untuk cache, blacklist, dan rate limit")
+	return r
 }

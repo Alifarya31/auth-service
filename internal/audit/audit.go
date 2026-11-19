@@ -73,6 +73,9 @@ func NewLogger(db *pgxpool.Pool) *Logger {
 // Log menulis event secara sinkron. Kegagalan menulis audit hanya di-log
 // (tidak menggagalkan request) agar outage audit tidak mematikan login.
 func (l *Logger) Log(ctx context.Context, e Event) {
+	if l == nil { // Logger nil = audit dimatikan (dipakai di unit test tanpa DB)
+		return
+	}
 	if e.Metadata == nil {
 		e.Metadata = map[string]any{}
 	}

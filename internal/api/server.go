@@ -13,6 +13,7 @@ import (
 	"auth-service/internal/rbac"
 	"auth-service/internal/security"
 	"auth-service/internal/store"
+	"auth-service/openapi"
 )
 
 type Server struct {
@@ -52,6 +53,10 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+	mux.HandleFunc("GET /openapi.yaml", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/yaml")
+		_, _ = w.Write(openapi.Spec)
 	})
 
 	// 2.2 Auth flow

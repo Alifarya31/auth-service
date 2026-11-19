@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"sync"
 	"testing"
 )
 
@@ -73,6 +74,34 @@ func TestRefreshRotationAndReuseDetection(t *testing.T) {
 	c.expect(c.do("POST", "/auth/refresh", "", map[string]any{"refresh_token": newRefresh}), http.StatusUnauthorized)
 
 	c.expect(c.do("POST", "/auth/refresh", "", map[string]any{"refresh_token": "garbage"}), http.StatusUnauthorized)
+}
+
+// Dua request refresh bersamaan dengan token yang sama: hanya satu yang
+// boleh berhasil (baris token dikunci dengan SELECT ... FOR UPDATE).
+func TestConcurrentRefreshOnlyOneWins(t *testing.T) {
+	c := newIntegrationServer(t)
+	f := c.newTenant()
+
+	const n = 5
+	codes := make(chan int, n)
+	var wg sync.WaitGroup
+	for range n {
+		wg.Go(func() {
+			codes <- c.do("POST", "/auth/refresh", "", map[string]any{"refresh_token": f.Refresh}).Status
+		})
+	}
+	wg.Wait()
+	close(codes)
+
+	ok := 0
+	for code := range codes {
+		if code == http.StatusOK {
+			ok++
+		}
+	}
+	if ok != 1 {
+		t.Fatalf("harus tepat 1 refresh berhasil, dapat %d", ok)
+	}
 }
 
 func TestLogoutRevokesTokens(t *testing.T) {

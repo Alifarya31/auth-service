@@ -33,8 +33,9 @@ services:
       # Di dalam jaringan compose, host database/redis adalah nama service.
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
       REDIS_URL: redis://redis:6379/0
+      PORT: "8080" # port di dalam container; port host diatur APP_HOST_PORT
     ports:
-      - "${PORT:-8080}:8080"
+      - "${APP_HOST_PORT:-8080}:8080"
     depends_on:
       postgres:
         condition: service_healthy

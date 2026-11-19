@@ -1,0 +1,394 @@
+openapi: 3.0.3
+info:
+  title: Auth Service (RBAC, multi-tenant, audit trail)
+  version: 1.0.0
+  description: |
+    Service autentikasi & otorisasi terpusat.
+
+    - Access token: JWT HS256 (default 15 menit), berisi `sub` (user), `tid` (tenant), `jti`.
+    - Refresh token: string acak, dirotasi setiap `/auth/refresh`. Reuse token lama mencabut seluruh sesi terkait.
+    - Endpoint `/api/*` memeriksa permission user **di tenant pada token**.
+    - Endpoint bertanda "sensitif" juga butuh header `X-2FA-Code` (simulasi 2FA).
+servers:
+  - url: http://localhost:8080
+
+tags:
+  - name: auth
+  - name: users
+  - name: roles
+  - name: tenants
+  - name: audit
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    TwoFA:
+      name: X-2FA-Code
+      in: header
+      required: true
+      description: Kode 2FA simulasi (nilai env TWO_FA_CODE).
+      schema: { type: string }
+    IdPath:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string, example: forbidden }
+        message: { type: string }
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        full_name: { type: string }
+        is_active: { type: boolean }
+        created_at: { type: string, format: date-time }
+    TenantUser:
+      allOf:
+        - $ref: '#/components/schemas/User'
+        - type: object
+          properties:
+            roles: { type: array, items: { type: string } }
+    Tenant:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        slug: { type: string }
+        created_at: { type: string, format: date-time }
+    Role:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        name: { type: string }
+        description: { type: string }
+        created_at: { type: string, format: date-time }
+    Tokens:
+      type: object
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+        token_type: { type: string, example: Bearer }
+        expires_in: { type: integer, description: Umur access token (detik), example: 900 }
+    Access:
+      type: object
+      properties:
+        roles: { type: array, items: { type: string }, example: [admin] }
+        permissions: { type: array, items: { type: string }, example: [users:read, audit:read] }
+    AuditEvent:
+      type: object
+      properties:
+        id: { type: integer }
+        user_id: { type: string, format: uuid, nullable: true }
+        tenant_id: { type: string, format: uuid, nullable: true }
+        action: { type: string, example: auth.login }
+        ip: { type: string }
+        user_agent: { type: string }
+        metadata: { type: object, additionalProperties: true }
+        created_at: { type: string, format: date-time }
+
+  responses:
+    BadRequest:
+      description: Input tidak valid
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Unauthorized:
+      description: Token tidak ada, tidak valid, kedaluwarsa, atau sudah dicabut
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Forbidden:
+      description: Tidak punya permission, 2FA tidak valid, lintas tenant, atau IP tidak diizinkan
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    NotFound:
+      description: Resource tidak ada di tenant pemanggil
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Conflict:
+      description: Data sudah ada
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+paths:
+  /healthz:
+    get:
+      summary: Health check
+      responses:
+        '200': { description: OK }
+
+  /auth/register:
+    post:
+      tags: [auth]
+      summary: Daftar tenant baru beserta user pemilik (role admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password, full_name, tenant_name, tenant_slug]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string, minLength: 8, maxLength: 72 }
+                full_name: { type: string }
+                tenant_name: { type: string, example: Universitas Contoh }
+                tenant_slug: { type: string, pattern: '^[a-z0-9][a-z0-9-]{1,48}[a-z0-9]$', example: univ-contoh }
+      responses:
+        '201':
+          description: Tenant dan user dibuat
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/User' }
+                  tenant: { $ref: '#/components/schemas/Tenant' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /auth/login:
+    post:
+      tags: [auth]
+      summary: Login ke satu tenant
+      description: Dibatasi LOGIN_MAX_ATTEMPTS percobaan per (IP + email) per LOGIN_WINDOW.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password, tenant_slug]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+                tenant_slug: { type: string }
+      responses:
+        '200':
+          description: Login berhasil
+          content: { application/json: { schema: { $ref: '#/components/schemas/Tokens' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429':
+          description: Terlalu banyak percobaan
+          headers:
+            Retry-After: { schema: { type: integer } }
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /auth/refresh:
+    post:
+      tags: [auth]
+      summary: Rotasi refresh token
+      description: |
+        Mengembalikan access token dan refresh token baru; refresh token lama langsung tidak berlaku.
+        Jika refresh token yang sudah dipakai dikirim lagi, seluruh family token dicabut (`token_reused`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token: { type: string }
+      responses:
+        '200':
+          description: Token baru
+          content: { application/json: { schema: { $ref: '#/components/schemas/Tokens' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/logout:
+    post:
+      tags: [auth]
+      summary: Logout (blacklist access token + cabut refresh token)
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                refresh_token: { type: string }
+      responses:
+        '204': { description: Berhasil logout }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/me:
+    get:
+      tags: [auth]
+      summary: User saat ini + tenant + role + permission
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Access'
+                  - type: object
+                    properties:
+                      user: { $ref: '#/components/schemas/User' }
+                      tenant: { $ref: '#/components/schemas/Tenant' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/users:
+    post:
+      tags: [users]
+      summary: Buat user di tenant (admin, sensitif)
+      description: 'Permission: `users:create` + 2FA.'
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/TwoFA' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password, full_name]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string, minLength: 8, maxLength: 72 }
+                full_name: { type: string }
+                roles: { type: array, items: { type: string }, default: [member] }
+      responses:
+        '201':
+          description: User dibuat
+          content: { application/json: { schema: { $ref: '#/components/schemas/TenantUser' } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/users/{id}/permissions:
+    get:
+      tags: [users]
+      summary: Role dan permission user di tenant pemanggil
+      description: 'Permission: `users:read`.'
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/IdPath' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Access'
+                  - type: object
+                    properties:
+                      user_id: { type: string, format: uuid }
+                      tenant_id: { type: string, format: uuid }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/roles:
+    post:
+      tags: [roles]
+      summary: Buat role (sensitif)
+      description: 'Permission: `roles:create` + 2FA.'
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/TwoFA' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, pattern: '^[a-z0-9_-]{2,50}$', example: auditor }
+                description: { type: string }
+      responses:
+        '201':
+          description: Role dibuat
+          content: { application/json: { schema: { $ref: '#/components/schemas/Role' } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/roles/{id}/permissions:
+    post:
+      tags: [roles]
+      summary: Tambah permission ke role (sensitif)
+      description: |
+        Permission: `roles:assign_permissions` + 2FA.
+        Permission tersedia: `users:create`, `users:read`, `roles:create`, `roles:assign_permissions`, `audit:read`.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdPath'
+        - $ref: '#/components/parameters/TwoFA'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [permissions]
+              properties:
+                permissions: { type: array, items: { type: string }, example: [audit:read] }
+      responses:
+        '200':
+          description: Daftar permission role setelah perubahan
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  role_id: { type: string, format: uuid }
+                  permissions: { type: array, items: { type: string } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/tenants/{id}/users:
+    get:
+      tags: [tenants]
+      summary: Daftar user tenant
+      description: 'Permission: `users:read`. `{id}` harus sama dengan tenant pada token.'
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/IdPath' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenant_id: { type: string, format: uuid }
+                  users: { type: array, items: { $ref: '#/components/schemas/TenantUser' } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/audit/log:
+    get:
+      tags: [audit]
+      summary: Audit log tenant pemanggil
+      description: 'Permission: `audit:read`. Urut terbaru lebih dulu.'
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: action, in: query, schema: { type: string, example: auth.login } }
+        - { name: user_id, in: query, schema: { type: string, format: uuid } }
+        - { name: from, in: query, description: 'RFC3339 atau YYYY-MM-DD (inklusif)', schema: { type: string } }
+        - { name: to, in: query, description: 'RFC3339 (eksklusif) atau YYYY-MM-DD (seluruh hari itu ikut)', schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+        - { name: offset, in: query, schema: { type: integer, minimum: 0, default: 0 } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events: { type: array, items: { $ref: '#/components/schemas/AuditEvent' } }
+                  limit: { type: integer }
+                  offset: { type: integer }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }

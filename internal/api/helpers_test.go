@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"auth-service/internal/audit"
 	"auth-service/internal/config"
@@ -48,13 +49,14 @@ func newIntegrationServer(t *testing.T) *testClient {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &testClient{t: t, h: s.Handler(), srv: s}
+	return &testClient{t: t, h: s.Handler(), srv: s, pool: pool}
 }
 
 type testClient struct {
-	t   *testing.T
-	h   http.Handler
-	srv *Server
+	t    *testing.T
+	h    http.Handler
+	srv  *Server
+	pool *pgxpool.Pool
 }
 
 type resp struct {

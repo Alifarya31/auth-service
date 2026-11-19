@@ -61,6 +61,15 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /auth/logout", s.authenticate(http.HandlerFunc(s.handleLogout)))
 	mux.Handle("GET /auth/me", s.authenticate(http.HandlerFunc(s.handleMe)))
 
+	// 2.6 API. Tiap endpoint menyebut permission yang dibutuhkan; endpoint
+	// yang mengubah user/role/permission juga butuh 2FA.
+	mux.Handle("POST /api/users", s.guardSensitive("users:create", s.handleCreateUser))
+	mux.Handle("GET /api/users/{id}/permissions", s.guard("users:read", s.handleUserPermissions))
+	mux.Handle("POST /api/roles", s.guardSensitive("roles:create", s.handleCreateRole))
+	mux.Handle("POST /api/roles/{id}/permissions", s.guardSensitive("roles:assign_permissions", s.handleAddRolePermissions))
+	mux.Handle("GET /api/tenants/{id}/users", s.guard("users:read", s.handleTenantUsers))
+	mux.Handle("GET /api/audit/log", s.guard("audit:read", s.handleAuditLog))
+
 	// Urutan luar -> dalam: catat IP klien, lalu cek IP whitelist.
 	return s.withRequestInfo(s.ipWhitelist(mux))
 }
